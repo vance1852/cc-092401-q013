@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
+from .timequality import ObservationTimeError, normalize_observed_at
+
 
 class ValidationError(ValueError):
     """输入不能满足领域契约。"""
@@ -215,6 +217,11 @@ class Observation:
     @classmethod
     def from_dict(cls, raw: object, protocol: Protocol) -> "Observation":
         data = _require_mapping(raw, "observation")
+        observed_at_raw = _required_text(data.get("observed_at"), "observation.observed_at")
+        try:
+            observed_at = normalize_observed_at(observed_at_raw)
+        except ObservationTimeError as exc:
+            raise ValidationError(str(exc)) from exc
         protocol_id = _required_text(data.get("protocol_id"), "observation.protocol_id")
         protocol_version = data.get("protocol_version")
         if protocol_id != protocol.protocol_id or protocol_version != protocol.version:
@@ -244,7 +251,7 @@ class Observation:
             protocol_id=protocol_id,
             protocol_version=protocol.version,
             stratum_key=stratum_key,
-            observed_at=_required_text(data.get("observed_at"), "observation.observed_at"),
+            observed_at=observed_at,
             metrics=parsed,
             excluded_reason=_optional_text(data.get("excluded_reason"), "observation.excluded_reason"),
         )

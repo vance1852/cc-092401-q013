@@ -57,6 +57,35 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
 
+    def _observation(self, observed_at: object) -> dict:
+        return {
+            "source_batch": "batch",
+            "source_row": "1",
+            "robot_id": "r1",
+            "protocol_id": self.protocol.protocol_id,
+            "protocol_version": self.protocol.version,
+            "stratum_key": "clear-aisle",
+            "observed_at": observed_at,
+            "metrics": {"completed": 1, "completion_seconds": 4, "interventions": 0},
+            "excluded_reason": None,
+        }
+
+    def test_observed_at_is_normalized_to_utc(self) -> None:
+        item = Observation.from_dict(self._observation("2026-09-21T10:00:00+08:00"), self.protocol)
+        self.assertEqual(item.observed_at, "2026-09-21T02:00:00Z")
+
+    def test_observed_at_without_timezone_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "时区"):
+            Observation.from_dict(self._observation("2026-09-21T10:00:00"), self.protocol)
+
+    def test_observed_at_unparseable_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "ISO 8601"):
+            Observation.from_dict(self._observation("昨天上午十点"), self.protocol)
+
+    def test_observed_at_must_be_text(self) -> None:
+        with self.assertRaises(ValidationError):
+            Observation.from_dict(self._observation(20260921), self.protocol)
+
 
 if __name__ == "__main__":
     unittest.main()

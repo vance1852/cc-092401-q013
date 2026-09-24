@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .clock import FrozenClock
 from .jsonio import load_json
 from .service import TrialService
 from .storage import connect, inspect_schema
@@ -20,11 +22,23 @@ def run(workspace: Path) -> dict[str, object]:
         for line in (fixtures / "demo_observations.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    late_row = {
+        "source_batch": "hall-b-20260921",
+        "source_row": "101",
+        "robot_id": "robot-a",
+        "protocol_id": protocol["protocol_id"],
+        "protocol_version": protocol["version"],
+        "stratum_key": "cross-traffic",
+        "observed_at": "2026-09-21T12:00:00+08:00",
+        "metrics": {"completed": 1, "completion_seconds": "55.0", "interventions": 1},
+        "excluded_reason": None,
+    }
     with tempfile.TemporaryDirectory(prefix="robot-trials-") as temporary:
         database = Path(temporary) / "foundation.sqlite3"
         connection = connect(database)
         try:
-            service = TrialService(connection)
+            clock = FrozenClock(datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc))
+            service = TrialService(connection, clock)
             service.create_user("operator-1", "测试操作员", "operator")
             service.create_user("stat-1", "统计负责人", "statistician")
             service.create_user("approver-1", "准入审批人", "approver")
@@ -34,10 +48,17 @@ def run(workspace: Path) -> dict[str, object]:
             service.publish_protocol("stat-1", protocol)
             service.create_batch("operator-1", "batch-demo", protocol["protocol_id"], protocol["version"], "build-a1")
             service.start_batch("operator-1", "batch-demo", 1)
+            clock.advance(hours=3)
             imported = service.import_observations(
                 "operator-1", "batch-demo", "demo-import-1", observation_rows
             )
             service.seal_batch("stat-1", "batch-demo", 2)
+            clock.advance(hours=2)
+            late_import = service.import_observations("operator-1", "batch-demo", "demo-import-2", [late_row])
+            late_observation_id = late_import["records"][0]["observation_id"]
+            adjudication = service.adjudicate_late_observation(
+                "stat-1", late_observation_id, "included", "跨地区班组补传，原始记录齐全"
+            )
             job = service.claim_job("worker-1", lease_seconds=60)
             if job is None:
                 raise RuntimeError("未能领取分析任务")
@@ -50,12 +71,15 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
+    time_quality = report["time_quality"]
     return {
         "status": "ok",
         "protocol": f"{protocol['protocol_id']}@{protocol['version']}",
-        "observation_count": imported["inserted"],
+        "observation_count": imported["inserted"] + late_import["inserted"],
+        "late_adjudication": adjudication["action"],
+        "time_status_counts": time_quality["counts"],
         "analysis_id": analysis["analysis_id"],
         "input_sha256": analysis["input_sha256"],
         "conclusion": analysis["result"]["conclusion"],

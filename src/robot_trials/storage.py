@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS batches (
     build_id TEXT NOT NULL REFERENCES builds(build_id),
     state TEXT NOT NULL CHECK (state IN ('draft', 'running', 'sealed', 'analyzing', 'analyzed', 'decided')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    late_grace_seconds INTEGER NOT NULL DEFAULT 86400 CHECK (late_grace_seconds >= 0),
     created_by TEXT NOT NULL REFERENCES users(user_id),
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -76,12 +77,28 @@ CREATE TABLE IF NOT EXISTS observations (
     robot_id TEXT NOT NULL REFERENCES robots(robot_id),
     stratum_key TEXT NOT NULL,
     observed_at TEXT NOT NULL,
+    observed_at_raw TEXT NOT NULL,
+    time_status TEXT NOT NULL CHECK (time_status IN ('normal', 'pending_review', 'rejected')),
+    time_status_reason TEXT,
     metrics_json TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     imported_by TEXT NOT NULL REFERENCES users(user_id),
     imported_at TEXT NOT NULL,
     UNIQUE (batch_id, source_batch, source_row)
 );
+
+CREATE TABLE IF NOT EXISTS late_adjudications (
+    adjudication_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
+    action TEXT NOT NULL CHECK (action IN ('included', 'excluded')),
+    reason TEXT NOT NULL,
+    decided_by TEXT NOT NULL REFERENCES users(user_id),
+    decided_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS late_adjudications_by_observation
+ON late_adjudications(observation_id, adjudication_id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     scope TEXT NOT NULL,
@@ -162,7 +179,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "audit_events", "late_adjudications",
 })
 
 

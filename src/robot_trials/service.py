@@ -14,14 +14,23 @@ from .contracts import Observation, Protocol, ValidationError
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
+from .timequality import (
+    TIME_STATUS_NORMAL,
+    TIME_STATUS_PENDING,
+    TIME_STATUS_REJECTED,
+    classify_observation_time,
+    parse_observed_at,
+)
 
+
+DEFAULT_LATE_GRACE_SECONDS = 86400
 
 ROLE_PERMISSIONS = {
     "operator": {
         "catalog.write", "batch.create", "batch.start", "observation.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run", "late.review"},
     "approver": {"decision.write"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -30,10 +39,25 @@ ROLE_PERMISSIONS = {
 class TrialService:
     """在单个 SQLite 连接上提供全部业务操作。"""
 
-    def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        clock=None,
+        *,
+        late_grace_seconds: int = DEFAULT_LATE_GRACE_SECONDS,
+        future_tolerance_seconds: int = 0,
+    ) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        self.late_grace_seconds = self._non_negative_seconds(late_grace_seconds, "迟到宽限秒数")
+        self.future_tolerance_seconds = self._non_negative_seconds(future_tolerance_seconds, "未来时间容忍秒数")
         initialize(connection)
+
+    @staticmethod
+    def _non_negative_seconds(value: int, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValidationFailed(f"{label}必须是非负整数")
+        return value
 
     def _now(self) -> str:
         return isoformat(self.clock.now())
@@ -155,15 +179,18 @@ class TrialService:
         protocol_id: str,
         protocol_version: int,
         build_id: str,
+        late_grace_seconds: int | None = None,
     ) -> dict[str, Any]:
         self._require(actor_id, "batch.create")
         self._protocol(protocol_id, protocol_version)
+        grace = self.late_grace_seconds if late_grace_seconds is None else late_grace_seconds
+        grace = self._non_negative_seconds(grace, "迟到宽限秒数")
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO batches(batch_id,protocol_id,protocol_version,build_id,state,created_by,created_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (batch_id, protocol_id, protocol_version, build_id, "draft", actor_id, self._now()),
+                    "INSERT INTO batches(batch_id,protocol_id,protocol_version,build_id,state,late_grace_seconds,"
+                    "created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (batch_id, protocol_id, protocol_version, build_id, "draft", grace, actor_id, self._now()),
                 )
                 self._audit("batch", batch_id, "batch.created", actor_id, {"build_id": build_id})
         except sqlite3.IntegrityError as exc:
@@ -200,6 +227,35 @@ class TrialService:
             raise Conflict("同一幂等键对应了不同请求内容")
         return json.loads(row["response_json"])
 
+    def _import_window(self, batch: Mapping[str, Any]) -> None:
+        """运行中可直接导入；封存后仅在迟到宽限窗口内接受补传。"""
+
+        if batch["state"] == "running":
+            return
+        if batch["state"] == "sealed":
+            sealed_at = parse_observed_at(batch["sealed_at"], "batch.sealed_at")
+            deadline = sealed_at + timedelta(seconds=batch["late_grace_seconds"])
+            if self.clock.now() <= deadline:
+                return
+            raise InvalidState("迟到宽限期已过，批次不再接受补传")
+        raise InvalidState("只有运行中或封存宽限期内的批次可以导入观测")
+
+    def _classify_row_time(self, item: Observation, batch: Mapping[str, Any]) -> tuple[str, str | None]:
+        started_at = parse_observed_at(batch["started_at"], "batch.started_at")
+        sealed_at = (
+            None
+            if batch["sealed_at"] is None
+            else parse_observed_at(batch["sealed_at"], "batch.sealed_at")
+        )
+        return classify_observation_time(
+            parse_observed_at(item.observed_at),
+            started_at=started_at,
+            sealed_at=sealed_at,
+            grace=timedelta(seconds=batch["late_grace_seconds"]),
+            now=self.clock.now(),
+            future_tolerance=timedelta(seconds=self.future_tolerance_seconds),
+        )
+
     def import_observations(
         self,
         actor_id: str,
@@ -217,10 +273,10 @@ class TrialService:
         if existing is not None:
             return existing
         batch = self.get_batch(batch_id)
-        if batch["state"] != "running":
-            raise InvalidState("只有运行中的批次可以导入观测")
+        self._import_window(batch)
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
         parsed: list[Observation] = []
+        classified: list[tuple[str, str | None]] = []
         for raw in rows:
             try:
                 item = Observation.from_dict(raw, protocol)
@@ -231,13 +287,18 @@ class TrialService:
             ).fetchone()["robot_id"]:
                 raise ValidationFailed("观测机器人与批次构建不一致")
             parsed.append(item)
-        response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
+            classified.append(self._classify_row_time(item, batch))
+        counts = {status: 0 for status in (TIME_STATUS_NORMAL, TIME_STATUS_PENDING, TIME_STATUS_REJECTED)}
+        for status, _ in classified:
+            counts[status] += 1
         try:
             with transaction(self.connection, immediate=True):
-                for item, raw in zip(parsed, rows):
-                    self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
-                        "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                records = []
+                for item, raw, (status, reason) in zip(parsed, rows, classified):
+                    cursor = self.connection.execute(
+                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
+                        "observed_at_raw,time_status,time_status_reason,metrics_json,raw_json,content_sha256,"
+                        "imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             batch_id,
                             item.source_batch,
@@ -245,12 +306,31 @@ class TrialService:
                             item.robot_id,
                             item.stratum_key,
                             item.observed_at,
+                            str(raw["observed_at"]).strip(),
+                            status,
+                            reason,
                             canonical_json({key: format(value, "f") for key, value in item.metrics.items()}),
+                            canonical_json(raw),
                             content_digest([raw]),
                             actor_id,
                             self._now(),
                         ),
                     )
+                    records.append({
+                        "observation_id": cursor.lastrowid,
+                        "source_batch": item.source_batch,
+                        "source_row": item.source_row,
+                        "observed_at": item.observed_at,
+                        "time_status": status,
+                        "time_status_reason": reason,
+                    })
+                response = {
+                    "batch_id": batch_id,
+                    "inserted": len(parsed),
+                    "request_sha256": request_digest,
+                    "time_status_counts": counts,
+                    "records": records,
+                }
                 self.connection.execute(
                     "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) VALUES(?,?,?,?,?)",
                     (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
@@ -336,6 +416,45 @@ class TrialService:
             )
         return {"exclusion_id": exclusion_id, "status": "revoked"}
 
+    def adjudicate_late_observation(
+        self, actor_id: str, observation_id: int, action: str, reason: str
+    ) -> dict[str, Any]:
+        """独立统计负责人对迟到观测作出纳入或排除裁决，历史只增不改。"""
+
+        self._require(actor_id, "late.review")
+        if action not in {"included", "excluded"}:
+            raise ValidationFailed("裁决动作必须是 included 或 excluded")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationFailed("裁决必须说明理由")
+        observation = self.connection.execute(
+            "SELECT observation_id,batch_id,time_status,imported_by FROM observations WHERE observation_id=?",
+            (observation_id,),
+        ).fetchone()
+        if observation is None:
+            raise NotFound("观测不存在")
+        if observation["time_status"] != TIME_STATUS_PENDING:
+            raise InvalidState("只有待裁决的迟到观测可以裁决")
+        if observation["imported_by"] == actor_id:
+            raise Forbidden("导入人不能裁决自己导入的迟到观测")
+        batch = self.get_batch(observation["batch_id"])
+        if batch["state"] != "sealed":
+            raise InvalidState("批次不在封存待裁决状态")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO late_adjudications(observation_id,action,reason,decided_by,decided_at) "
+                "VALUES(?,?,?,?,?)",
+                (observation_id, action, reason.strip(), actor_id, self._now()),
+            )
+            adjudication_id = cursor.lastrowid
+            self._audit(
+                "observation",
+                str(observation_id),
+                "late_adjudication.recorded",
+                actor_id,
+                {"adjudication_id": adjudication_id, "action": action, "reason": reason.strip()},
+            )
+        return {"adjudication_id": adjudication_id, "observation_id": observation_id, "action": action}
+
     def seal_batch(self, actor_id: str, batch_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "batch.seal")
         with transaction(self.connection, immediate=True):
@@ -386,13 +505,20 @@ class TrialService:
 
     def _analysis_observations(self, batch_id: str, protocol: Protocol) -> tuple[Observation, ...]:
         rows = self.connection.execute(
-            "SELECT o.*,e.reason AS excluded_reason FROM observations o "
+            "SELECT o.*,e.reason AS excluded_reason,"
+            "(SELECT a.action FROM late_adjudications a WHERE a.observation_id=o.observation_id "
+            "ORDER BY a.adjudication_id DESC LIMIT 1) AS late_action "
+            "FROM observations o "
             "LEFT JOIN exclusion_requests e ON e.observation_id=o.observation_id AND e.status='approved' "
             "WHERE o.batch_id=? ORDER BY o.observation_id",
             (batch_id,),
         ).fetchall()
         items: list[Observation] = []
         for row in rows:
+            if row["time_status"] == TIME_STATUS_REJECTED:
+                continue
+            if row["time_status"] == TIME_STATUS_PENDING and row["late_action"] != "included":
+                continue
             metrics = json.loads(row["metrics_json"])
             items.append(Observation(
                 source_batch=row["source_batch"],
@@ -407,6 +533,13 @@ class TrialService:
             ))
         return tuple(items)
 
+    def _unadjudicated_late_count(self, batch_id: str) -> int:
+        return self.connection.execute(
+            "SELECT count(*) FROM observations o WHERE o.batch_id=? AND o.time_status=? AND NOT EXISTS "
+            "(SELECT 1 FROM late_adjudications a WHERE a.observation_id=o.observation_id)",
+            (batch_id, TIME_STATUS_PENDING),
+        ).fetchone()[0]
+
     def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
         self._require(statistician_id, "analysis.run")
         job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -417,6 +550,8 @@ class TrialService:
         if job["lease_expires_at"] <= self._now():
             raise InvalidState("任务租约已经过期")
         batch = self.get_batch(job["batch_id"])
+        if self._unadjudicated_late_count(batch["batch_id"]):
+            raise InvalidState("仍有待裁决的迟到观测，不能完成分析")
         protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
         observations = self._analysis_observations(batch["batch_id"], protocol)
         snapshot_rows = [
@@ -538,6 +673,55 @@ class TrialService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        time_rows = self.connection.execute(
+            "SELECT observation_id,source_batch,source_row,observed_at,observed_at_raw,"
+            "time_status,time_status_reason,imported_by,imported_at FROM observations "
+            "WHERE batch_id=? AND time_status!=? ORDER BY observation_id",
+            (batch_id, TIME_STATUS_NORMAL),
+        ).fetchall()
+        adjudication_rows = self.connection.execute(
+            "SELECT a.adjudication_id,a.observation_id,a.action,a.reason,a.decided_by,a.decided_at "
+            "FROM late_adjudications a JOIN observations o ON o.observation_id=a.observation_id "
+            "WHERE o.batch_id=? ORDER BY a.adjudication_id",
+            (batch_id,),
+        ).fetchall()
+        adjudications_by_observation: dict[int, list[dict[str, Any]]] = {}
+        for row in adjudication_rows:
+            adjudications_by_observation.setdefault(row["observation_id"], []).append({
+                "adjudication_id": row["adjudication_id"],
+                "action": row["action"],
+                "reason": row["reason"],
+                "decided_by": row["decided_by"],
+                "decided_at": row["decided_at"],
+            })
+        counts = {status: 0 for status in (TIME_STATUS_NORMAL, TIME_STATUS_PENDING, TIME_STATUS_REJECTED)}
+        for row in self.connection.execute(
+            "SELECT time_status,count(*) AS n FROM observations WHERE batch_id=? GROUP BY time_status",
+            (batch_id,),
+        ).fetchall():
+            counts[row["time_status"]] = row["n"]
+        time_records = []
+        for row in time_rows:
+            history = adjudications_by_observation.get(row["observation_id"], [])
+            if row["time_status"] == TIME_STATUS_REJECTED:
+                effective = "rejected"
+            elif not history:
+                effective = "pending"
+            else:
+                effective = history[-1]["action"]
+            time_records.append({
+                "observation_id": row["observation_id"],
+                "source_batch": row["source_batch"],
+                "source_row": row["source_row"],
+                "observed_at": row["observed_at"],
+                "observed_at_raw": row["observed_at_raw"],
+                "time_status": row["time_status"],
+                "time_status_reason": row["time_status_reason"],
+                "imported_by": row["imported_by"],
+                "imported_at": row["imported_at"],
+                "effective_status": effective,
+                "adjudications": history,
+            })
         return {
             "batch": batch,
             "protocol": {
@@ -556,5 +740,10 @@ class TrialService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
+            "time_quality": {
+                "late_grace_seconds": batch["late_grace_seconds"],
+                "counts": counts,
+                "records": time_records,
+            },
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

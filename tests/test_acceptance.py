@@ -13,7 +13,11 @@ class AcceptanceTests(unittest.TestCase):
     def test_offline_acceptance(self) -> None:
         result = run(ROOT)
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["observation_count"], 6)
+        self.assertEqual(result["observation_count"], 7)
+        self.assertEqual(result["late_adjudication"], "included")
+        self.assertEqual(
+            result["time_status_counts"], {"normal": 6, "pending_review": 1, "rejected": 0}
+        )
         self.assertEqual(result["schema"]["missing_tables"], [])
         self.assertEqual(result["conclusion"], "pass")
         self.assertEqual(result["decision"], "approved")
