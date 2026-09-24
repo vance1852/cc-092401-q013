@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS batches (
     build_id TEXT NOT NULL REFERENCES builds(build_id),
     state TEXT NOT NULL CHECK (state IN ('draft', 'running', 'sealed', 'analyzing', 'analyzed', 'decided')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    late_grace_seconds INTEGER NOT NULL DEFAULT 86400 CHECK (late_grace_seconds >= 0),
+    future_tolerance_seconds INTEGER NOT NULL DEFAULT 300 CHECK (future_tolerance_seconds >= 0),
     created_by TEXT NOT NULL REFERENCES users(user_id),
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -76,12 +78,29 @@ CREATE TABLE IF NOT EXISTS observations (
     robot_id TEXT NOT NULL REFERENCES robots(robot_id),
     stratum_key TEXT NOT NULL,
     observed_at TEXT NOT NULL,
+    observed_at_raw TEXT NOT NULL DEFAULT '',
+    raw_json TEXT NOT NULL DEFAULT '',
+    time_classification TEXT NOT NULL DEFAULT 'normal'
+        CHECK (time_classification IN ('normal', 'late_pending', 'rejected')),
+    classification_reason TEXT,
     metrics_json TEXT NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     imported_by TEXT NOT NULL REFERENCES users(user_id),
     imported_at TEXT NOT NULL,
     UNIQUE (batch_id, source_batch, source_row)
 );
+
+CREATE TABLE IF NOT EXISTS lateness_adjudications (
+    adjudication_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
+    action TEXT NOT NULL CHECK (action IN ('included', 'excluded')),
+    reason TEXT NOT NULL,
+    adjudicated_by TEXT NOT NULL REFERENCES users(user_id),
+    adjudicated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS lateness_adjudications_observation
+ON lateness_adjudications(observation_id, adjudication_id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     scope TEXT NOT NULL,
@@ -161,8 +180,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
-    "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "observations", "lateness_adjudications", "idempotency_keys", "exclusion_requests",
+    "analysis_jobs", "analyses", "decisions", "audit_events",
 })
 
 
@@ -190,10 +209,49 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """为旧版本数据库补列；列已存在时不做任何事。"""
+
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """把 v2 及更早的库结构补齐到当前版本；对新库是无操作。"""
+
+    _ensure_column(
+        connection, "batches", "late_grace_seconds",
+        "late_grace_seconds INTEGER NOT NULL DEFAULT 86400 CHECK (late_grace_seconds >= 0)",
+    )
+    _ensure_column(
+        connection, "batches", "future_tolerance_seconds",
+        "future_tolerance_seconds INTEGER NOT NULL DEFAULT 300 CHECK (future_tolerance_seconds >= 0)",
+    )
+    _ensure_column(
+        connection, "observations", "observed_at_raw",
+        "observed_at_raw TEXT NOT NULL DEFAULT ''",
+    )
+    _ensure_column(
+        connection, "observations", "raw_json",
+        "raw_json TEXT NOT NULL DEFAULT ''",
+    )
+    _ensure_column(
+        connection, "observations", "time_classification",
+        "time_classification TEXT NOT NULL DEFAULT 'normal' "
+        "CHECK (time_classification IN ('normal', 'late_pending', 'rejected'))",
+    )
+    _ensure_column(
+        connection, "observations", "classification_reason",
+        "classification_reason TEXT",
+    )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "

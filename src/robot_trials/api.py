@@ -77,6 +77,8 @@ class JsonApplication:
                 result = self.service.create_batch(
                     self._actor(normalized_headers), payload["batch_id"], payload["protocol_id"],
                     int(payload["protocol_version"]), payload["build_id"],
+                    late_grace_seconds=payload.get("late_grace_seconds"),
+                    future_tolerance_seconds=payload.get("future_tolerance_seconds"),
                 )
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "start":
@@ -114,6 +116,11 @@ class JsonApplication:
                     self._actor(normalized_headers), int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "observations" and parts[2] == "adjudication":
+                result = self.service.adjudicate_lateness(
+                    self._actor(normalized_headers), int(parts[1]), payload["action"], payload["reason"]
+                )
+                return Response(201, result)
             if method == "POST" and path == "/jobs/claim":
                 result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})

@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .clock import FrozenClock
 from .jsonio import load_json
 from .service import TrialService
 from .storage import connect, inspect_schema
@@ -24,7 +26,9 @@ def run(workspace: Path) -> dict[str, object]:
         database = Path(temporary) / "foundation.sqlite3"
         connection = connect(database)
         try:
-            service = TrialService(connection)
+            # 冻结时钟让验收完全确定：批次 2026-09-21 00:00Z 开始，导入前推进到 04:00Z
+            clock = FrozenClock(datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc))
+            service = TrialService(connection, clock)
             service.create_user("operator-1", "测试操作员", "operator")
             service.create_user("stat-1", "统计负责人", "statistician")
             service.create_user("approver-1", "准入审批人", "approver")
@@ -34,6 +38,7 @@ def run(workspace: Path) -> dict[str, object]:
             service.publish_protocol("stat-1", protocol)
             service.create_batch("operator-1", "batch-demo", protocol["protocol_id"], protocol["version"], "build-a1")
             service.start_batch("operator-1", "batch-demo", 1)
+            clock.advance(hours=4)
             imported = service.import_observations(
                 "operator-1", "batch-demo", "demo-import-1", observation_rows
             )
@@ -50,7 +55,7 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",

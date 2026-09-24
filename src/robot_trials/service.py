@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
-from .contracts import Observation, Protocol, ValidationError
+from .contracts import Observation, Protocol, ValidationError, parse_observed_at
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
+from .timequality import (
+    DEFAULT_FUTURE_TOLERANCE_SECONDS,
+    DEFAULT_LATE_GRACE_SECONDS,
+    LATE_PENDING,
+    MAX_WINDOW_SECONDS,
+    NORMAL,
+    classify_observation,
+)
 
 
 ROLE_PERMISSIONS = {
@@ -21,10 +29,16 @@ ROLE_PERMISSIONS = {
         "catalog.write", "batch.create", "batch.start", "observation.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run", "lateness.review"},
     "approver": {"decision.write"},
     "auditor": {"report.read", "audit.read"},
 }
+
+
+def _window_seconds(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > MAX_WINDOW_SECONDS:
+        raise ValidationFailed(f"{name} 必须是 0 到 {MAX_WINDOW_SECONDS} 之间的整数秒")
+    return value
 
 
 class TrialService:
@@ -155,17 +169,36 @@ class TrialService:
         protocol_id: str,
         protocol_version: int,
         build_id: str,
+        *,
+        late_grace_seconds: int | None = None,
+        future_tolerance_seconds: int | None = None,
     ) -> dict[str, Any]:
         self._require(actor_id, "batch.create")
         self._protocol(protocol_id, protocol_version)
+        late_grace = (
+            DEFAULT_LATE_GRACE_SECONDS if late_grace_seconds is None
+            else _window_seconds("late_grace_seconds", late_grace_seconds)
+        )
+        future_tolerance = (
+            DEFAULT_FUTURE_TOLERANCE_SECONDS if future_tolerance_seconds is None
+            else _window_seconds("future_tolerance_seconds", future_tolerance_seconds)
+        )
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO batches(batch_id,protocol_id,protocol_version,build_id,state,created_by,created_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (batch_id, protocol_id, protocol_version, build_id, "draft", actor_id, self._now()),
+                    "INSERT INTO batches(batch_id,protocol_id,protocol_version,build_id,state,"
+                    "late_grace_seconds,future_tolerance_seconds,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        batch_id, protocol_id, protocol_version, build_id, "draft",
+                        late_grace, future_tolerance, actor_id, self._now(),
+                    ),
                 )
-                self._audit("batch", batch_id, "batch.created", actor_id, {"build_id": build_id})
+                self._audit("batch", batch_id, "batch.created", actor_id, {
+                    "build_id": build_id,
+                    "late_grace_seconds": late_grace,
+                    "future_tolerance_seconds": future_tolerance,
+                })
         except sqlite3.IntegrityError as exc:
             raise Conflict("批次编号冲突或构建不存在") from exc
         return self.get_batch(batch_id)
@@ -217,27 +250,41 @@ class TrialService:
         if existing is not None:
             return existing
         batch = self.get_batch(batch_id)
-        if batch["state"] != "running":
-            raise InvalidState("只有运行中的批次可以导入观测")
+        if batch["state"] not in ("running", "sealed"):
+            raise InvalidState("只有运行中或已封存的批次可以导入观测")
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
-        parsed: list[Observation] = []
+        robot_id = self.connection.execute(
+            "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
+        ).fetchone()["robot_id"]
+        started_at = datetime.fromisoformat(batch["started_at"])
+        sealed_at = datetime.fromisoformat(batch["sealed_at"]) if batch["sealed_at"] else None
+        now = self.clock.now()
+        parsed: list[tuple[Observation, str, str | None, Mapping[str, Any]]] = []
         for raw in rows:
             try:
                 item = Observation.from_dict(raw, protocol)
             except ValidationError as exc:
                 raise ValidationFailed(str(exc)) from exc
-            if item.robot_id != self.connection.execute(
-                "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
-            ).fetchone()["robot_id"]:
+            if item.robot_id != robot_id:
                 raise ValidationFailed("观测机器人与批次构建不一致")
-            parsed.append(item)
-        response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
+            classification, reason = classify_observation(
+                parse_observed_at(item.observed_at),
+                started_at=started_at,
+                sealed_at=sealed_at,
+                now=now,
+                late_grace_seconds=batch["late_grace_seconds"],
+                future_tolerance_seconds=batch["future_tolerance_seconds"],
+            )
+            parsed.append((item, classification, reason, raw))
+        counts = {NORMAL: 0, LATE_PENDING: 0, "rejected": 0}
+        classifications: list[dict[str, Any]] = []
         try:
             with transaction(self.connection, immediate=True):
-                for item, raw in zip(parsed, rows):
-                    self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
-                        "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                for item, classification, reason, raw in parsed:
+                    cursor = self.connection.execute(
+                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
+                        "observed_at_raw,raw_json,time_classification,classification_reason,"
+                        "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             batch_id,
                             item.source_batch,
@@ -245,17 +292,40 @@ class TrialService:
                             item.robot_id,
                             item.stratum_key,
                             item.observed_at,
+                            item.observed_at_raw,
+                            canonical_json(raw),
+                            classification,
+                            reason,
                             canonical_json({key: format(value, "f") for key, value in item.metrics.items()}),
                             content_digest([raw]),
                             actor_id,
                             self._now(),
                         ),
                     )
+                    counts[classification] += 1
+                    classifications.append({
+                        "observation_id": cursor.lastrowid,
+                        "source_batch": item.source_batch,
+                        "source_row": item.source_row,
+                        "classification": classification,
+                        "reason": reason,
+                    })
+                response = {
+                    "batch_id": batch_id,
+                    "inserted": len(parsed),
+                    "request_sha256": request_digest,
+                    "counts": counts,
+                    "classifications": classifications,
+                }
                 self.connection.execute(
                     "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) VALUES(?,?,?,?,?)",
                     (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
-                self._audit("batch", batch_id, "observations.imported", actor_id, response)
+                self._audit("batch", batch_id, "observations.imported", actor_id, {
+                    "inserted": len(parsed),
+                    "counts": counts,
+                    "request_sha256": request_digest,
+                })
         except sqlite3.IntegrityError as exc:
             raise Conflict("来源行重复或幂等键并发冲突") from exc
         return response
@@ -336,6 +406,82 @@ class TrialService:
             )
         return {"exclusion_id": exclusion_id, "status": "revoked"}
 
+    def _pending_lateness_count(self, batch_id: str) -> int:
+        return self.connection.execute(
+            "SELECT count(*) FROM observations o WHERE o.batch_id=? AND o.time_classification='late_pending' "
+            "AND NOT EXISTS (SELECT 1 FROM lateness_adjudications a WHERE a.observation_id=o.observation_id)",
+            (batch_id,),
+        ).fetchone()[0]
+
+    def adjudicate_lateness(
+        self, actor_id: str, observation_id: int, action: str, reason: str
+    ) -> dict[str, Any]:
+        """统计负责人对隔离的迟到观测做出纳入/排除裁决；历史只增不改。"""
+
+        self._require(actor_id, "lateness.review")
+        if action not in {"include", "exclude"}:
+            raise ValidationFailed("未知裁决动作，只能是 include 或 exclude")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationFailed("裁决必须说明理由")
+        observation = self.connection.execute(
+            "SELECT observation_id,batch_id,time_classification,imported_by FROM observations "
+            "WHERE observation_id=?",
+            (observation_id,),
+        ).fetchone()
+        if observation is None:
+            raise NotFound("观测不存在")
+        if observation["time_classification"] != LATE_PENDING:
+            raise InvalidState("只有待裁决的迟到观测可以裁决")
+        if observation["imported_by"] == actor_id:
+            raise Forbidden("导入人不能裁决自己导入的观测")
+        batch = self.get_batch(observation["batch_id"])
+        if batch["state"] not in ("sealed", "analyzed"):
+            raise InvalidState("批次当前状态不能裁决迟到观测")
+        stored_action = "included" if action == "include" else "excluded"
+        reanalysis_queued = False
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO lateness_adjudications(observation_id,action,reason,adjudicated_by,adjudicated_at) "
+                "VALUES(?,?,?,?,?)",
+                (observation_id, stored_action, reason.strip(), actor_id, self._now()),
+            )
+            adjudication_id = cursor.lastrowid
+            self._audit(
+                "observation",
+                str(observation_id),
+                f"lateness.{stored_action}",
+                actor_id,
+                {"adjudication_id": adjudication_id, "reason": reason.strip()},
+            )
+            if batch["state"] == "analyzed":
+                # 裁决改变了有效数据集：排入新修订版的分析任务，封存时刻保持不变
+                new_revision = batch["revision"] + 1
+                now = self._now()
+                self.connection.execute(
+                    "UPDATE batches SET state='sealed',revision=? "
+                    "WHERE batch_id=? AND state='analyzed' AND revision=?",
+                    (new_revision, batch["batch_id"], batch["revision"]),
+                )
+                self.connection.execute(
+                    "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,created_at,updated_at) "
+                    "VALUES(?,?, 'queued', ?,?,?)",
+                    (batch["batch_id"], new_revision, now, now, now),
+                )
+                self._audit(
+                    "batch",
+                    batch["batch_id"],
+                    "analysis.requeued",
+                    actor_id,
+                    {"revision": new_revision, "trigger": "lateness_adjudication"},
+                )
+                reanalysis_queued = True
+        return {
+            "adjudication_id": adjudication_id,
+            "observation_id": observation_id,
+            "status": stored_action,
+            "reanalysis_queued": reanalysis_queued,
+        }
+
     def seal_batch(self, actor_id: str, batch_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "batch.seal")
         with transaction(self.connection, immediate=True):
@@ -386,13 +532,27 @@ class TrialService:
 
     def _analysis_observations(self, batch_id: str, protocol: Protocol) -> tuple[Observation, ...]:
         rows = self.connection.execute(
-            "SELECT o.*,e.reason AS excluded_reason FROM observations o "
+            "SELECT o.*,e.reason AS excluded_reason,"
+            "(SELECT a.action FROM lateness_adjudications a WHERE a.observation_id=o.observation_id "
+            " ORDER BY a.adjudication_id DESC LIMIT 1) AS late_action,"
+            "(SELECT a.reason FROM lateness_adjudications a WHERE a.observation_id=o.observation_id "
+            " ORDER BY a.adjudication_id DESC LIMIT 1) AS late_reason "
+            "FROM observations o "
             "LEFT JOIN exclusion_requests e ON e.observation_id=o.observation_id AND e.status='approved' "
-            "WHERE o.batch_id=? ORDER BY o.observation_id",
+            "WHERE o.batch_id=? AND o.time_classification != 'rejected' ORDER BY o.observation_id",
             (batch_id,),
         ).fetchall()
         items: list[Observation] = []
         for row in rows:
+            excluded_reason = row["excluded_reason"]
+            lateness_status: str | None = None
+            if row["time_classification"] == LATE_PENDING:
+                if row["late_action"] is None:
+                    # 待裁决的迟到观测保持隔离，不进入分析
+                    continue
+                lateness_status = row["late_action"]
+                if row["late_action"] == "excluded" and excluded_reason is None:
+                    excluded_reason = f"迟到裁决排除：{row['late_reason']}"
             metrics = json.loads(row["metrics_json"])
             items.append(Observation(
                 source_batch=row["source_batch"],
@@ -403,7 +563,10 @@ class TrialService:
                 stratum_key=row["stratum_key"],
                 observed_at=row["observed_at"],
                 metrics={key: Decimal(str(value)) for key, value in metrics.items()},
-                excluded_reason=row["excluded_reason"],
+                excluded_reason=excluded_reason,
+                observed_at_raw=row["observed_at_raw"],
+                time_classification=row["time_classification"],
+                lateness_status=lateness_status,
             ))
         return tuple(items)
 
@@ -424,6 +587,9 @@ class TrialService:
                 "source_batch": item.source_batch,
                 "source_row": item.source_row,
                 "stratum": item.stratum_key,
+                "observed_at": item.observed_at,
+                "time_classification": item.time_classification,
+                "lateness_status": item.lateness_status,
                 "metrics": {key: format(value, "f") for key, value in item.metrics.items()},
                 "excluded_reason": item.excluded_reason,
             }
@@ -495,6 +661,8 @@ class TrialService:
         batch = self.get_batch(batch_id)
         if batch["state"] != "analyzed" or batch["revision"] != analysis_row["batch_revision"]:
             raise InvalidState("分析不是批次当前可审批版本")
+        if self._pending_lateness_count(batch_id):
+            raise InvalidState("仍有待裁决的迟到观测，不能形成决定")
         try:
             with transaction(self.connection, immediate=True):
                 cursor = self.connection.execute(
@@ -538,6 +706,54 @@ class TrialService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        time_rows = self.connection.execute(
+            "SELECT observation_id,source_batch,source_row,observed_at,observed_at_raw,"
+            "time_classification,classification_reason,imported_by FROM observations "
+            "WHERE batch_id=? AND time_classification!='normal' ORDER BY observation_id",
+            (batch_id,),
+        ).fetchall()
+        time_records: list[dict[str, Any]] = []
+        awaiting = adjudicated_included = adjudicated_excluded = 0
+        for row in time_rows:
+            adjudications = [
+                dict(item)
+                for item in self.connection.execute(
+                    "SELECT adjudication_id,action,reason,adjudicated_by,adjudicated_at "
+                    "FROM lateness_adjudications WHERE observation_id=? ORDER BY adjudication_id",
+                    (row["observation_id"],),
+                ).fetchall()
+            ]
+            if row["time_classification"] == "rejected":
+                status = "rejected"
+            elif not adjudications:
+                status = "pending"
+                awaiting += 1
+            else:
+                status = adjudications[-1]["action"]
+            if status == "included":
+                adjudicated_included += 1
+            elif status == "excluded":
+                adjudicated_excluded += 1
+            time_records.append({
+                "observation_id": row["observation_id"],
+                "source_batch": row["source_batch"],
+                "source_row": row["source_row"],
+                "observed_at": row["observed_at"],
+                "observed_at_raw": row["observed_at_raw"],
+                "classification": row["time_classification"],
+                "classification_reason": row["classification_reason"],
+                "imported_by": row["imported_by"],
+                "status": status,
+                "adjudications": adjudications,
+            })
+        classification_counts = {
+            row["time_classification"]: row["n"]
+            for row in self.connection.execute(
+                "SELECT time_classification,count(*) AS n FROM observations WHERE batch_id=? "
+                "GROUP BY time_classification",
+                (batch_id,),
+            ).fetchall()
+        }
         return {
             "batch": batch,
             "protocol": {
@@ -556,5 +772,16 @@ class TrialService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
+            "time_quality": {
+                "summary": {
+                    "normal": classification_counts.get("normal", 0),
+                    "late_pending": classification_counts.get("late_pending", 0),
+                    "rejected": classification_counts.get("rejected", 0),
+                    "awaiting_adjudication": awaiting,
+                    "adjudicated_included": adjudicated_included,
+                    "adjudicated_excluded": adjudicated_excluded,
+                },
+                "records": time_records,
+            },
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

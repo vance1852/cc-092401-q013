@@ -3,12 +3,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
+
+from .clock import isoformat
 
 
 class ValidationError(ValueError):
     """输入不能满足领域契约。"""
+
+
+def parse_observed_at(value: object, path: str = "observation.observed_at") -> datetime:
+    """把提交值解析为带时区的 datetime；不满足硬性要求时抛 ValidationError。
+
+    硬性要求：非空字符串、可被 ISO 8601 解析、显式携带时区偏移。
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{path} 必须是非空字符串")
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValidationError(f"{path} 必须是可解析的 ISO 8601 时间") from exc
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        raise ValidationError(f"{path} 必须携带时区偏移")
+    return parsed
 
 
 def _require_mapping(value: object, path: str) -> Mapping[str, Any]:
@@ -211,6 +232,9 @@ class Observation:
     observed_at: str
     metrics: Mapping[str, Decimal]
     excluded_reason: str | None
+    observed_at_raw: str | None = None
+    time_classification: str = "normal"
+    lateness_status: str | None = None
 
     @classmethod
     def from_dict(cls, raw: object, protocol: Protocol) -> "Observation":
@@ -237,6 +261,8 @@ class Observation:
             if metric.kind == "count" and number != number.to_integral_value():
                 raise ValidationError(f"observation.metrics.{key} 必须是整数")
             parsed[key] = number
+        observed_at_raw = _required_text(data.get("observed_at"), "observation.observed_at")
+        observed_at = isoformat(parse_observed_at(observed_at_raw))
         return cls(
             source_batch=_required_text(data.get("source_batch"), "observation.source_batch"),
             source_row=_required_text(data.get("source_row"), "observation.source_row"),
@@ -244,7 +270,8 @@ class Observation:
             protocol_id=protocol_id,
             protocol_version=protocol.version,
             stratum_key=stratum_key,
-            observed_at=_required_text(data.get("observed_at"), "observation.observed_at"),
+            observed_at=observed_at,
             metrics=parsed,
             excluded_reason=_optional_text(data.get("excluded_reason"), "observation.excluded_reason"),
+            observed_at_raw=observed_at_raw,
         )
